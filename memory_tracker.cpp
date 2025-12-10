@@ -15,7 +15,7 @@
 #define FUNCTION_LINE_MAX_LEN 88
 #define FILE_MAX_LEN 32
 #define LINE_MAX_LEN 7
-
+#define HASH_TABLE_SIZE 1024
 
 // 简单的分配信息结构
 struct AllocationInfo {
@@ -26,7 +26,13 @@ struct AllocationInfo {
     char file[FILE_MAX_LEN];
     uintptr_t address;
     size_t allocation_id;
-    AllocationInfo* next;
+};
+
+// 哈希表节点结构
+struct HashNode {
+    void *ptr;
+    AllocationInfo info;
+    HashNode* next;
 };
 
 // 新增：统计相同来源的泄漏计数
@@ -39,7 +45,8 @@ struct SourceLeakCount {
 };
 
 // 全局变量
-static AllocationInfo* allocation_list = nullptr;
+static HashNode* hash_table[HASH_TABLE_SIZE] = {nullptr};
+static AllocationInfo* hash_snapshot = nullptr; // 哈希表快照 用纯数组保存
 static size_t total_allocated = 0;
 static size_t total_freed = 0;
 static size_t allocation_counter = 0;
@@ -48,9 +55,54 @@ static bool tracking_enabled = false;
 static size_t output_min_count = 5;
 static size_t output_sort_type = 1; // 0:不排序 1:按照次数排序  2:按照total_size排序
 
+//哈希函数
+static inline size_t hash_ptr(void* ptr) {
+    uintptr_t addr = (uintptr_t)ptr;
+    return (addr >> 3) % HASH_TABLE_SIZE;
+}
 
+//在哈希表中查找指针
+static HashNode* find_in_hash_table(void* ptr) {
+    size_t index = hash_ptr(ptr);
+    HashNode* current = hash_table[index];
 
+    while(current) {
+        if(current->ptr = ptr) {
+            return current;
+        }
+        current = current->next;
+    }
+    return nullptr;
+}
 
+//向哈希表中添加记录
+static void add_to_hash_table(void*ptr, const AllocationInfo& info) {
+    size_t index = hash_ptr(ptr);
+    HashNode* node = (HashNode*)malloc(sizeof(HashNode));
+    if(node) {
+        node->ptr = ptr;
+        node->info = info;
+        node->next = hash_table[index];
+        hash_table[index] = node;
+    }
+}
+
+// 从哈希表中删除记录
+static void remove_from_hash_table(void* ptr) {
+    size_t index = hash_ptr(ptr);
+    HashNode** current = &hash_table[index];
+
+    while(*current) {
+        if((*current)->ptr == ptr) {
+            HashNode* to_delete = *current;
+            total_freed += to_delete->info.size;
+            *current = (*current)->next;
+            free(to_delete);
+            return;
+        }
+        current = &(*current)->next;
+    }
+}
 
 void init_memory_tracking() {
     tracking_enabled = true;
@@ -58,13 +110,18 @@ void init_memory_tracking() {
 
 void shutdown_memory_tracking() {
     std::lock_guard<std::mutex> lock(allocation_mutex);
-    AllocationInfo* current = allocation_list;
-    while (current) {
-        AllocationInfo* next = current->next;
-        free(current);
-        current = next;
+    
+    //清空哈希表
+    for(int i=0; i < HASH_TABLE_SIZE; i++) {
+        HashNode* current = hash_table[i];
+        while(current) {
+            HashNode* next = current->next;
+            free(current);
+            current = next;
+        }
+        hash_table[i] = nullptr;
     }
-    allocation_list = nullptr;
+
     total_allocated = 0;
     total_freed = 0;
     allocation_counter = 0;
@@ -166,23 +223,17 @@ void* mt_new(size_t size, void* address, const char* file, const char* function,
         total_allocated += size;
         allocation_counter++;
         
-        AllocationInfo* info = (AllocationInfo*)malloc(sizeof(AllocationInfo));
-        if (info) {
-            info->ptr = ptr;
-            info->size = size;
-            info->type = type;
-            info->address = (uintptr_t)address;
-            info->allocation_id = allocation_counter;
-            strcpy(info->function_line, function_line);
-            strcpy(info->file, file);
-            info->next = allocation_list;
-            allocation_list = info;
-            
-            #ifdef MEMORY_DEBUG_VERBOSE
-            std::cout << "Allocated " << size << " bytes at address " << ptr 
-                      << " (ID: " << allocation_counter << ")" << std::endl;
-            #endif
-        }
+        AllocationInfo info;
+        info.ptr = ptr;
+        info.size = size;
+        info.type = type;
+        info.address = (uintptr_t)address;
+        info.allocation_id = allocation_counter;
+        strcpy(info.function_line, function_line);
+        strcpy(info.file, file);
+        
+        add_to_hash_table(ptr, info);    
+
 		free((void*)function_line);
     }
   
@@ -195,25 +246,8 @@ void mt_delete(void* ptr){
     if (tracking_enabled) {
         std::lock_guard<std::mutex> lock(allocation_mutex);
         
-        AllocationInfo** current = &allocation_list;
-        while (*current) {
-            if ((*current)->ptr == ptr) {
-                size_t size = (*current)->size;
-                total_freed += size;
-                
-                #ifdef MEMORY_DEBUG_VERBOSE
-                std::cout << "Freed " << size << " bytes at address " << ptr 
-                          << " (ID: " << (*current)->allocation_id 
-                          << ", Source: " << (*current)->source << ")" << std::endl;
-                #endif
-                
-                AllocationInfo* to_delete = *current;
-                *current = (*current)->next;
-                free(to_delete);
-                break;
-            }
-            current = &(*current)->next;
-        }
+        //从哈希表中删除
+        remove_from_hash_table(ptr);
     }
     
     free(ptr);
@@ -261,49 +295,82 @@ void mt_free(void* ptr)
 size_t get_leak_count() {
     if (!tracking_enabled) return 0;
     
-    // std::lock_guard<std::mutex> lock(allocation_mutex);
+    std::lock_guard<std::mutex> lock(allocation_mutex);
     size_t count = 0;
-    AllocationInfo* current = allocation_list;
-    while (current) {
-        count++;
-        current = current->next;
+    for(int i = 0; i < HASH_TABLE_SIZE; i++) {
+        HashNode* current = hash_table[i];
+        while(current) {
+            count++;
+            current = current->next;
+        }
     }
     return count;
+}
+
+// 创建哈希快照
+static size_t save_hash_table_snapshot() {
+    size_t total_count = get_leak_count();
+    hash_snapshot = (AllocationInfo*)malloc(total_count * sizeof(AllocationInfo));
+    size_t index = 0;
+    std::lock_guard<std::mutex> lock(allocation_mutex);
+    for(int i = 0; i < HASH_TABLE_SIZE; i++) {
+        HashNode* current = hash_table[i];
+        //std::cout << "正在保存哈希表索引:" << i << std::endl;
+        while(current) {
+            hash_snapshot[index].ptr = current->info.ptr;
+            hash_snapshot[index].size = current->info.size;
+            hash_snapshot[index].type = current->info.type;
+            strcpy(hash_snapshot[index].function_line, current->info.function_line);
+            strcpy(hash_snapshot[index].file, current->info.file);
+            hash_snapshot[index].address = current->info.address;
+            hash_snapshot[index].allocation_id = current->info.allocation_id;
+            index++;
+            if(index >= total_count) {
+                return index;
+            }
+            current = current->next;
+        }
+    }
+    return index;
 }
 
 // 新增：按来源统计泄漏信息
 void get_leak_stats_by_source(std::unordered_map<uintptr_t, SourceLeakCount>& leak_stats) {
     if (!tracking_enabled) return;
     
-    // std::lock_guard<std::mutex> lock(allocation_mutex);
-    AllocationInfo* current = allocation_list;
-    size_t total_count = get_leak_count();
     size_t count = 0;
     int last_printed_percent = -1;
-    while (current) {
-        // std::cout << "开始 创建 source_str" << count <<std::endl;
-        std::string function_line_str(current->function_line);
-        std::string file_str(current->file);
+
+    size_t total_count = save_hash_table_snapshot();
+    std::cout << "快照保存完成 总长度是:" << total_count << std::endl;
+    //遍历哈希表
+    for(int i = 0; i < total_count; i++) {
+        AllocationInfo current = hash_snapshot[i];
+        
+        std::string function_line_str(current.function_line);
+        std::string file_str(current.file);
 
         auto result = leak_stats.insert(
-            std::make_pair(current->address, SourceLeakCount{current->type, 1, current->size, file_str, function_line_str})
+            std::make_pair(current.address, SourceLeakCount{current.type, 1, current.size, file_str, function_line_str})
         );
         // std::cout << "插入结束" << count <<std::endl;
         if (!result.second) {
             // 键已存在，更新计数和大小
             result.first->second.count++;
-            result.first->second.total_size += current->size;
+            result.first->second.total_size += current.size;
         }
-        current = current->next;
         count++;
+
         int current_percent = (int)((count * 100LL) / total_count);
         if (current_percent > last_printed_percent && current_percent % 5 == 0 && current_percent != 0) {
             last_printed_percent = current_percent;
             std::cout << "进度: " << current_percent << "% (" 
                 << count << "/" << total_count << ")" << std::endl;
         }
-        
     }
+    //释放快照内存
+    free(hash_snapshot);
+    hash_snapshot = nullptr;
 }
 
 void print_memory_stats() {
