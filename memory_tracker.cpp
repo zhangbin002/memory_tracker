@@ -61,19 +61,21 @@ static inline size_t hash_ptr(void* ptr) {
     return (addr >> 3) % HASH_TABLE_SIZE;
 }
 
+/*
 //在哈希表中查找指针
 static HashNode* find_in_hash_table(void* ptr) {
     size_t index = hash_ptr(ptr);
     HashNode* current = hash_table[index];
 
     while(current) {
-        if(current->ptr = ptr) {
+        if(current->ptr == ptr) {
             return current;
         }
         current = current->next;
     }
     return nullptr;
 }
+*/
 
 //向哈希表中添加记录
 static void add_to_hash_table(void*ptr, const AllocationInfo& info) {
